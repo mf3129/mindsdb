@@ -16,6 +16,8 @@ from .count import responder as responder_count
 from .aggregate import responder as responder_aggregate
 from .get_free_monitoring_status import responder as responder_get_free_monitoring_status
 from .end_sessions import responder as responder_end_sessions
+from .ping import responder as responder_ping
+from .get_parameter import responder as responder_get_parameter
 
 from .list_indexes import responder as responder_list_indexes
 from .list_collections import responder as responder_list_collections
@@ -51,6 +53,9 @@ responders = [
     responder_aggregate,
     responder_get_free_monitoring_status,
     responder_end_sessions,
+    responder_ping,
+    responder_get_parameter,
+
     # user queries
     responder_list_indexes,
     responder_list_collections,

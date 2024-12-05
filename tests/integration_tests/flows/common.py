@@ -9,18 +9,20 @@ import sys
 from pathlib import Path
 import signal
 
+import psutil
 import requests
 from pandas import DataFrame
 
 from ps import wait_port, is_port_in_use, net_connections
 
 
-
 HTTP_API_ROOT = 'http://localhost:47334/api'
 
 DATASETS_PATH = os.getenv('DATASETS_PATH')
 
-USE_EXTERNAL_DB_SERVER = bool(int(os.getenv('USE_EXTERNAL_DB_SERVER') or "1"))
+USE_EXTERNAL_DB_SERVER = bool(int(os.getenv('USE_EXTERNAL_DB_SERVER') or "0"))
+
+USE_PERSISTENT_STORAGE = bool(int(os.getenv('USE_PERSISTENT_STORAGE') or "0"))
 
 EXTERNAL_DB_CREDENTIALS = str(Path.home().joinpath('.mindsdb_credentials.json'))
 
@@ -35,7 +37,7 @@ START_TIMEOUT = 15
 OUTPUT = None  # [None|subprocess.DEVNULL]
 
 TEMP_DIR = Path(__file__).parent.absolute().joinpath('../../').joinpath(
-    f'temp/test_storage_{int(time.time()*1000)}/' if USE_EXTERNAL_DB_SERVER else 'temp/test_storage/'
+    f'temp/test_storage_{int(time.time()*1000)}/' if not USE_PERSISTENT_STORAGE else 'temp/test_storage/'
 ).resolve()
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -97,7 +99,8 @@ CONFIG_PATH = TEMP_DIR.joinpath('config.json')
 
 with open(TEST_CONFIG, 'rt') as f:
     config_json = json.loads(f.read())
-    config_json['storage_dir'] = str(TEMP_DIR)
+    config_json['storage_dir'] = f'{TEMP_DIR}'
+    config_json['storage_db'] = f'sqlite:///{TEMP_DIR}/mindsdb.sqlite3.db?check_same_thread=False&timeout=30'
 
 
 def close_all_ssh_tunnels():
@@ -108,12 +111,15 @@ def close_all_ssh_tunnels():
             sp.wait()
 
 
-def close_ssh_tunnel(sp, port):
-    sp.kill()
+def close_ssh_tunnel(port, sp=None):
+    if sp is not None:
+        sp.kill()
     # NOTE line below will close connection in ALL test instances.
     # sp = subprocess.Popen(f'for pid in $(lsof -i :{port} -t); do kill -9 $pid; done', shell=True)
-    sp = subprocess.Popen(f'ssh -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -O exit ubuntu@3.220.66.106', shell=True)
-    sp.wait()
+    if port is not None:
+        print(f'Closing ssh tunnel at port {port}')
+        sp = subprocess.Popen(f'ssh -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -O exit ubuntu@3.220.66.106', shell=True)
+        sp.wait()
 
 
 def open_ssh_tunnel(port, direction='R'):
@@ -121,10 +127,13 @@ def open_ssh_tunnel(port, direction='R'):
     if not path.is_dir():
         path.mkdir(mode=0o777, exist_ok=True, parents=True)
 
+    if port == 5005 and os.path.exists('/tmp/mindsdb/.mindsdb-ssh-ctrl-5005'):
+        return 0
+
     if is_mssql_test() and port != 5005:
-        cmd = f'ssh -i ~/.ssh/db_machine_ms -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} Administrator@107.21.140.172'
+        cmd = f'ssh -i ~/.ssh/db_machine_ms -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o TCPKeepAlive=yes -o ServerAliveCountMax=5 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} Administrator@107.21.140.172'
     else:
-        cmd = f'ssh -i ~/.ssh/db_machine -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} ubuntu@3.220.66.106'
+        cmd = f'ssh -i ~/.ssh/db_machine -S /tmp/mindsdb/.mindsdb-ssh-ctrl-{port} -o TCPKeepAlive=yes -o ServerAliveCountMax=5 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -fMN{direction} 127.0.0.1:{port}:127.0.0.1:{port} ubuntu@3.220.66.106'
     sp = subprocess.Popen(
         cmd.split(' '),
         stdout=OUTPUT,
@@ -136,9 +145,49 @@ def open_ssh_tunnel(port, direction='R'):
         status = 1
         sp.kill()
 
-    if status == 0:
-        atexit.register(close_ssh_tunnel, sp=sp, port=port)
     return status
+
+
+def stop_mindsdb(ports=None):
+    mdb_ports = [47334, 47335, 47336]
+    if isinstance(ports, list):
+        mdb_ports = mdb_ports + ports
+    procs = [x for x in net_connections() if x.pid is not None and x.laddr[1] in mdb_ports]
+    print(f'Found {len(procs)} MindsDB processes')
+
+    if len(procs) == 0:
+        print('Nothing to close')
+        return
+
+    for proc in procs:
+        print(f' -- {proc.pid} / {proc.laddr[1]} / {proc.status}')
+
+    pid_port = set((x.pid, x.laddr[1]) for x in procs)
+
+    interrupted_pids = []
+    for pid, port in pid_port:
+        if pid is None:
+            print(f'Can not release {port} because it occupied by OS')
+        elif pid not in interrupted_pids:
+            try:
+                p = psutil.Process(pid)
+                print(f'Send SIGINT to {pid}/{[port]}')
+                p.send_signal(signal.SIGINT)
+                interrupted_pids.append(pid)
+            except psutil.NoSuchProcess:
+                pass
+            except Exception as e:
+                print(f'Can not interrupt process {pid}: {e}')
+
+    waited_for = 0
+    waited_ports = [x for x in net_connections() if x.laddr[1] in mdb_ports]
+    while len(waited_ports) > 0 and waited_for < 30:
+        print(f'\nSome mindsdb ports are yet to die, waiting for them to do so: {[(x.pid, x.laddr[1], x.status) for x in waited_ports]}. Waited for a total of: {waited_for} seconds\n')
+        time.sleep(2)
+        waited_for += 2
+        waited_ports = [x for x in net_connections() if x.laddr[1] in mdb_ports]
+    if waited_for >= 30:
+        raise Exception('Some mindsdb ports can`t die.')
 
 
 def is_mssql_test():
@@ -148,17 +197,21 @@ def is_mssql_test():
     return False
 
 
+mindsdb_port = None
+
 if USE_EXTERNAL_DB_SERVER:
     open_ssh_tunnel(5005, 'L')
     wait_port(5005, timeout=10)
 
     close_all_ssh_tunnels()
+    stop_mindsdb()
 
     for _ in range(10):
         r = requests.get('http://127.0.0.1:5005/port')
         if r.status_code != 200:
             raise Exception('Cant get port to run mindsdb')
         mindsdb_port = r.content.decode()
+        print(f'Trying port forwarding on {mindsdb_port}')
         status = open_ssh_tunnel(mindsdb_port, 'R')
         if status == 0:
             break
@@ -166,6 +219,7 @@ if USE_EXTERNAL_DB_SERVER:
         raise Exception('Cant get empty port to run mindsdb')
 
     print(f'use mindsdb port={mindsdb_port}')
+    wait_port(mindsdb_port, timeout=10)
     config_json['api']['mysql']['port'] = mindsdb_port
     config_json['api']['mongodb']['port'] = mindsdb_port
 
@@ -177,10 +231,9 @@ if USE_EXTERNAL_DB_SERVER:
         credentials = json.loads(f.read())
     override = {}
     for key, value in credentials.items():
-        if key not in ("redis", "kafka"):
-            value['publish'] = False
-            value['type'] = key
-            config_json['integrations'][f'default_{key}'] = value
+        value['publish'] = False
+        value['type'] = key
+        config_json['integrations'][f'default_{key}'] = value
 
     AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', None)
     AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', None)
@@ -204,47 +257,14 @@ def make_test_csv(name, data):
     return str(test_csv_path)
 
 
-def stop_mindsdb(sp=None):
-    if sp:
-        #os.kill(sp.pid, signal.SIGTERM) #SIGINT
-        sp.kill()
-        time.sleep(2)
-        #sp.kill()
-    try:
-        os.system('ray stop --force')
-    except Exception as e:
-        print(e)
-        pass
-    try:
-        os.system('sudo ray stop --force')
-    except Exception as e:
-        print(e)
-        pass
-
-    mdb_ports = (47334, 47335, 47336, 8273, 8274, 8275)
-    procs = [[x.pid,x.laddr[1]] for x in net_connections() if x.pid is not None and x.laddr[1] in mdb_ports]
-
-    for proc in procs:
-        try:
-            os.kill(proc[0], 9)
-            pport = proc[1]
-            # I think this is what they call "defensive coding"...
-            os.system(f'sudo fuser -k {pport}/tcp')
-        # process may be killed by OS due to some reasons in that moment
-        except Exception as e:
-            pass
-
-    waited_for = 0
-    while len([x for x in net_connections() if x.laddr[1] in mdb_ports]):
-        print(f'\nSome mindsdb ports are yet to die, waiting for them to do so! Waited for a total of: {waited_for} seconds\n')
-        time.sleep(2)
-        waited_for += 2
-
 def override_recursive(a, b):
     for key in b:
         if isinstance(b[key], dict) is False:
             a[key] = b[key]
         elif key not in a or isinstance(a[key], dict) is False:
+            a[key] = b[key]
+        # make config section empty by demand
+        elif isinstance(b[key], dict) is True and b[key] == {}:
             a[key] = b[key]
         else:
             override_recursive(a[key], b[key])
@@ -260,23 +280,17 @@ def run_environment(apis, override_config={}):
 
     os.environ['CHECK_FOR_UPDATES'] = '0'
     print('Starting mindsdb process!')
-    try:
-        os.system('ray stop --force')
-    except Exception:
-        pass
-    try:
-        os.system('sudo ray stop --force')
-    except Exception:
-        pass
-    sp = subprocess.Popen(
+    subprocess.Popen(
         ['python3', '-m', 'mindsdb', f'--api={api_str}', f'--config={CONFIG_PATH}', '--verbose'],
         close_fds=True,
         stdout=OUTPUT,
         stderr=OUTPUT
     )
-    atexit.register(stop_mindsdb, sp=sp)
+    atexit.register(close_ssh_tunnel, port=mindsdb_port)
+    atexit.register(stop_mindsdb, ports=[mindsdb_port])
 
     print('Waiting on ports!')
+
     async def wait_port_async(port, timeout):
         start_time = time.time()
         started = is_port_in_use(port)
@@ -339,19 +353,27 @@ def check_prediction_values(row, to_predict):
     try:
         for field_name, field_type in to_predict.items():
             if field_type in [int, float]:
+                print(f'checking {field_name} is int or float')
+                print(row[field_name], type(row[field_name]))
                 assert isinstance(row[field_name], (int, float))
+                print('checking min bound')
                 assert isinstance(row[f'{field_name}_min'], (int, float))
+                print('checking max bound')
                 assert isinstance(row[f'{field_name}_max'], (int, float))
+                print('comparing the two')
                 assert row[f'{field_name}_max'] > row[f'{field_name}_min']
             elif field_type is str:
+                print(f'checking {field_name} is str')
                 assert isinstance(row[field_name], str)
             else:
                 assert False
 
+            print(f'checking confidence for {field_name}')
             assert isinstance(row[f'{field_name}_confidence'], (int, float))
+            print(f'checking explain for {field_name}')
             assert isinstance(row[f'{field_name}_explain'], (str, dict))
-    except Exception:
-        print('Wrong values in row:')
+    except Exception as e:
+        print(f'Error "{e}" | Wrong values in row:')
         print(row)
         return False
     return True

@@ -1,34 +1,32 @@
-import copy
-import datetime
-from dateutil.parser import parse as parse_datetime
-import subprocess
 import os
-import sys
+import copy
+import shutil
+import datetime
+import tempfile
+from pathlib import Path
+from dateutil.parser import parse as parse_datetime
 
 from flask import request
 from flask_restx import Resource, abort
 from flask import current_app as ca
-
-from mindsdb.utilities.log import log
-from mindsdb.api.http.namespaces.configs.config import ns_conf
-from mindsdb.utilities.log import get_logs
-from mindsdb.integrations import CHECKERS
-from mindsdb.api.http.utils import http_error
-from mindsdb.interfaces.database.integrations import (
-    add_db_integration,
-    modify_db_integration,
-    remove_db_integration,
-    get_db_integration,
-    get_db_integrations
-)
 from dateutil.tz import tzlocal
-from mindsdb.interfaces.database.database import DatabaseWrapper
+
+from mindsdb.api.http.namespaces.configs.config import ns_conf
+from mindsdb.api.http.utils import http_error
+from mindsdb.metrics.metrics import api_endpoint_metrics
+from mindsdb.utilities import log
+from mindsdb.utilities.functions import encrypt, decrypt
+from mindsdb.utilities.log_controller import get_logs
+from mindsdb.utilities.config import Config
+
+logger = log.getLogger(__name__)
 
 
 @ns_conf.route('/logs')
 @ns_conf.param('name', 'Get logs')
 class GetLogs(Resource):
     @ns_conf.doc('get_integrations')
+    @api_endpoint_metrics('GET', '/config/logs')
     def get(self):
         min_timestamp = parse_datetime(request.args['min_timestamp'])
         max_timestamp = request.args.get('max_timestamp', None)
@@ -41,12 +39,55 @@ class GetLogs(Resource):
         return {'data': logs}
 
 
+@ns_conf.route('/')
+@ns_conf.param('name', 'Get config')
+class GetConfig(Resource):
+    @ns_conf.doc('get_config')
+    @api_endpoint_metrics('GET', '/config')
+    def get(self):
+        config = Config()
+        return {
+            'auth': {
+                'http_auth_enabled': config['auth']['http_auth_enabled'],
+                'username': config['auth']['username'],
+                'password': config['auth']['password']
+            }
+        }
+
+    @ns_conf.doc('put_config')
+    @api_endpoint_metrics('PUT', '/config')
+    def put(self):
+        data = request.json
+
+        unknown_argumens = list(set(data.keys()) - {'auth'})
+        if len(unknown_argumens) > 0:
+            return http_error(
+                400, 'Wrong arguments',
+                f'Unknown argumens: {unknown_argumens}'
+            )
+
+        for key in data.keys():
+            unknown_argumens = list(
+                set(data[key].keys()) - set(Config()[key].keys())
+            )
+            if len(unknown_argumens) > 0:
+                return http_error(
+                    400, 'Wrong arguments',
+                    f'Unknown argumens: {unknown_argumens}'
+                )
+
+        Config().update(data)
+
+        return '', 200
+
+
 @ns_conf.route('/integrations')
 @ns_conf.param('name', 'List all database integration')
 class ListIntegration(Resource):
+    @api_endpoint_metrics('GET', '/config/integrations')
     def get(self):
         return {
-            'integrations': [k for k in get_db_integrations(request.company_id, False)]
+            'integrations': [k for k in ca.integration_controller.get_all(sensitive_info=False)]
         }
 
 
@@ -54,8 +95,9 @@ class ListIntegration(Resource):
 @ns_conf.param('name', 'List all database integration')
 class AllIntegration(Resource):
     @ns_conf.doc('get_all_integrations')
+    @api_endpoint_metrics('GET', '/config/all_integrations')
     def get(self):
-        integrations = get_db_integrations(request.company_id, False)
+        integrations = ca.integration_controller.get_all(sensitive_info=False)
         return integrations
 
 
@@ -63,113 +105,151 @@ class AllIntegration(Resource):
 @ns_conf.param('name', 'Database integration')
 class Integration(Resource):
     @ns_conf.doc('get_integration')
+    @api_endpoint_metrics('GET', '/config/integrations/integration')
     def get(self, name):
-        integration = get_db_integration(name, request.company_id, False)
+        integration = ca.integration_controller.get(name, sensitive_info=False)
         if integration is None:
             abort(404, f'Can\'t find database integration: {name}')
         integration = copy.deepcopy(integration)
         return integration
 
     @ns_conf.doc('put_integration')
+    @api_endpoint_metrics('PUT', '/config/integrations/integration')
     def put(self, name):
-        params = request.json.get('params')
-        if not isinstance(params, dict):
+        params = {}
+        if request.is_json:
+            params.update((request.json or {}).get('params', {}))
+        else:
+            params.update(request.form or {})
+
+        if len(params) == 0:
             abort(400, "type of 'params' must be dict")
 
+        files = request.files
+        temp_dir = None
+        if files is not None and len(files) > 0:
+            temp_dir = tempfile.mkdtemp(prefix='integration_files_')
+            for key, file in files.items():
+                temp_dir_path = Path(temp_dir)
+                file_name = Path(file.filename)
+                file_path = temp_dir_path.joinpath(file_name).resolve()
+                if temp_dir_path not in file_path.parents:
+                    raise Exception(f'Can not save file at path: {file_path}')
+                file.save(file_path)
+                params[key] = str(file_path)
+
         is_test = params.get('test', False)
+
+        config = Config()
+        secret_key = config.get('secret_key', 'dummy-key')
+
         if is_test:
             del params['test']
-            db_type = params.get('type')
-            checker_class = CHECKERS.get(db_type, None)
-            if checker_class is None:
-                abort(400, f"Unknown integration type: {db_type}")
-            checker = checker_class(**params)
-            return {'success': checker.check_connection()}, 200
 
-        integration = get_db_integration(name, request.company_id, False)
+            handler_type = params.pop('type', None)
+            params.pop('publish', None)
+            handler = ca.integration_controller.create_tmp_handler(
+                handler_type=handler_type,
+                connection_data=params
+            )
+
+            status = handler.check_connection()
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir)
+
+            resp = status.to_json()
+            if status.success and 'code' in params:
+                if hasattr(handler, 'handler_storage'):
+                    # attach storage if exists
+                    export = handler.handler_storage.export_files()
+                    if export:
+                        # encrypt with flask secret key
+                        encrypted = encrypt(export, secret_key)
+                        resp['storage'] = encrypted.decode()
+
+            return resp, 200
+
+        integration = ca.integration_controller.get(name, sensitive_info=False)
         if integration is not None:
             abort(400, f"Integration with name '{name}' already exists")
 
         try:
-            if 'enabled' in params:
-                params['publish'] = params['enabled']
-                del params['enabled']
-            add_db_integration(name, params, request.company_id)
+            engine = params['type']
+            if engine is not None:
+                del params['type']
+            params.pop('publish', False)
+            storage = params.pop('storage', None)
+            ca.integration_controller.add(name, engine, params)
 
-            model_data_arr = []
-            for model in request.native_interface.get_models():
-                if model['status'] == 'complete':
-                    try:
-                        model_data_arr.append(request.native_interface.get_model_data(model['name']))
-                    except Exception:
-                        pass
+            # copy storage
+            if storage is not None:
+                handler = ca.integration_controller.get_data_handler(name)
 
-            DatabaseWrapper(request.company_id).setup_integration(name)
-            if is_test is False and params.get('publish', False) is True:
-                DatabaseWrapper(request.company_id).register_predictors(model_data_arr, name)
+                export = decrypt(storage.encode(), secret_key)
+                handler.handler_storage.import_files(export)
+
         except Exception as e:
-            log.error(str(e))
+            logger.error(str(e))
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir)
             abort(500, f'Error during config update: {str(e)}')
 
-        return '', 200
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir)
+        return {}, 200
 
     @ns_conf.doc('delete_integration')
+    @api_endpoint_metrics('DELETE', '/config/integrations/integration')
     def delete(self, name):
-        integration = get_db_integration(name, request.company_id)
+        integration = ca.integration_controller.get(name)
         if integration is None:
             abort(400, f"Nothing to delete. '{name}' not exists.")
         try:
-            remove_db_integration(name, request.company_id)
+            ca.integration_controller.delete(name)
         except Exception as e:
-            log.error(str(e))
-            abort(500, f'Error during integration delete: {str(e)}')
-        return '', 200
+            logger.error(str(e))
+            abort(500, f"Error during integration delete: {str(e)}")
+        return "", 200
 
     @ns_conf.doc('modify_integration')
+    @api_endpoint_metrics('POST', '/config/integrations/integration')
     def post(self, name):
-        params = request.json.get('params')
+        params = {}
+        params.update((request.json or {}).get('params', {}))
+        params.update(request.form or {})
+
         if not isinstance(params, dict):
             abort(400, "type of 'params' must be dict")
-        integration = get_db_integration(name, request.company_id)
+        integration = ca.integration_controller.get(name)
         if integration is None:
             abort(400, f"Nothin to modify. '{name}' not exists.")
         try:
             if 'enabled' in params:
                 params['publish'] = params['enabled']
                 del params['enabled']
-            modify_db_integration(name, params, request.company_id)
-            DatabaseWrapper(request.company_id).setup_integration(name)
+            ca.integration_controller.modify(name, params)
+
         except Exception as e:
-            log.error(str(e))
-            abort(500, f'Error during integration modifycation: {str(e)}')
-        return '', 200
+            logger.error(str(e))
+            abort(500, f"Error during integration modifycation: {str(e)}")
+        return "", 200
 
 
 @ns_conf.route('/integrations/<name>/check')
 @ns_conf.param('name', 'Database integration checks')
 class Check(Resource):
     @ns_conf.doc('check')
+    @api_endpoint_metrics('GET', '/config/integrations/integration/check')
     def get(self, name):
-        company_id = request.company_id
-        if get_db_integration(name, company_id) is None:
+        if ca.integration_controller.get(name) is None:
             abort(404, f'Can\'t find database integration: {name}')
-        connections = DatabaseWrapper(company_id).check_connections()
+        connections = ca.integration_controller.check_connections()
         return connections.get(name, False), 200
-
-
-@ns_conf.route('/telemetry/<flag>')
-@ns_conf.param('flag', 'Turn telemtry on or off')
-class ToggleTelemetry(Resource):
-    @ns_conf.doc('check')
-    def get(self, flag):
-        if flag in ["True", "true", "t"]:
-            return 'Enabled telemetry', 200
-        else:
-            return 'Disabled telemetry', 200
 
 
 @ns_conf.route('/vars')
 class Vars(Resource):
+    @api_endpoint_metrics('GET', '/config/vars')
     def get(self):
         if os.getenv('CHECK_FOR_UPDATES', '1').lower() in ['0', 'false']:
             telemtry = False
@@ -182,7 +262,6 @@ class Vars(Resource):
             mongo = True
 
         cloud = ca.config_obj.get('cloud', False)
-
         local_time = datetime.datetime.now(tzlocal())
         local_timezone = local_time.tzname()
 
@@ -192,69 +271,3 @@ class Vars(Resource):
             'cloud': cloud,
             'timezone': local_timezone,
         }
-
-
-@ns_conf.param('flag', 'Turn telemtry on or off')
-class ToggleTelemetry2(Resource):
-    @ns_conf.doc('check')
-    def get(self, flag):
-        if flag in ["True", "true", "t"]:
-            return 'Enabled telemetry', 200
-        else:
-            return 'Disabled telemetry', 200
-
-
-@ns_conf.route('/install_options')
-@ns_conf.param('dependency_list', 'Install dependencies')
-class InstallDependenciesList(Resource):
-    def get(self):
-        return {'dependencies': ['snowflake', 'athena', 'google', 's3', 'lightgbm_gpu', 'mssql', 'cassandra', 'scylladb']}
-
-
-@ns_conf.route('/install/<dependency>')
-@ns_conf.param('dependency', 'Install dependencies')
-class InstallDependencies(Resource):
-    def get(self, dependency):
-        if dependency == 'snowflake':
-            dependency = ['snowflake-connector-python[pandas]', 'asn1crypto==1.3.0']
-        elif dependency == 'athena':
-            dependency = ['PyAthena >= 2.0.0']
-        elif dependency == 'google':
-            dependency = ['google-cloud-storage', 'google-auth']
-        elif dependency == 's3':
-            dependency = ['boto3 >= 1.9.0']
-        elif dependency == 'lightgbm_gpu':
-            dependency = ['lightgbm', '--install-option=--gpu', '--upgrade']
-        elif dependency == 'mssql':
-            dependency = ['pymssql >= 2.1.4']
-        elif dependency == 'cassandra':
-            dependency = ['cassandra-driver']
-        elif dependency == 'scylladb':
-            dependency = ['scylla-driver']
-        else:
-            return f'Unkown dependency: {dependency}', 400
-
-        outs = b''
-        errs = b''
-        try:
-            sp = subprocess.Popen(
-                [sys.executable, '-m', 'pip', 'install', *dependency],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            code = sp.wait()
-            outs, errs = sp.communicate(timeout=1)
-        except Exception as e:
-            return http_error(500, 'Failed to install dependency', str(e))
-
-        if code != 0:
-            output = ''
-            if isinstance(outs, bytes) and len(outs) > 0:
-                output = output + 'Output: ' + outs.decode()
-            if isinstance(errs, bytes) and len(errs) > 0:
-                if len(output) > 0:
-                    output = output + '\n'
-                output = output + 'Errors: ' + errs.decode()
-            return http_error(500, 'Failed to install dependency', output)
-
-        return 'Installed', 200
